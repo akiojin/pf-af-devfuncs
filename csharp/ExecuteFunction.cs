@@ -14,8 +14,8 @@ namespace PlayFab.AzureFunctions
     using System.Text;
     using System.Threading.Tasks;
     using Microsoft.AspNetCore.Http;
-    using Microsoft.Azure.WebJobs;
-    using Microsoft.Azure.WebJobs.Extensions.Http;
+    using Microsoft.Azure.Functions.Worker;
+    using Microsoft.Azure.Functions.Worker.Http;
     using Microsoft.Extensions.Logging;
     using PlayFab.Internal;
     using PlayFab.Json;
@@ -33,15 +33,14 @@ namespace PlayFab.AzureFunctions
         /// A local implementation of the ExecuteFunction feature. Provides the ability to execute an Azure Function with a local URL with respect to the host
         /// of the application this function is running in.
         /// </summary>
-        /// <param name="httpRequest">The HTTP request</param>
-        /// <param name="log">A logger object</param>
+        /// <param name="request">The HTTP request</param>
         /// <returns>The function execution result(s)</returns>
-        [FunctionName("ExecuteFunction")]
-        public static async Task<HttpResponseMessage> ExecuteFunction(
-            [HttpTrigger(AuthorizationLevel.Function, "post", Route = "CloudScript/ExecuteFunction")] HttpRequest request, ILogger log)
+        [Function(nameof(ExecuteFunction))]
+        public static async Task<HttpResponseData> ExecuteFunction(
+            [HttpTrigger(AuthorizationLevel.Function, "post", Route = "CloudScript/ExecuteFunction")] HttpRequestData request)
         {
             // Extract the caller's entity token
-            string callerEntityToken = request.Headers["X-EntityToken"];
+            string callerEntityToken = request.Headers.GetValues("X-EntityToken").First();
 
             // Extract the request body and deserialize
             string body = await DecompressHttpBody(request);
@@ -73,7 +72,7 @@ namespace PlayFab.AzureFunctions
             var functionRequestContent = new StringContent(PlayFabSimpleJson.SerializeObject(functionContext));
             functionRequestContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
 
-            var azureFunctionUri = ConstructLocalAzureFunctionUri(execRequest.FunctionName, request.Host);
+            var azureFunctionUri = ConstructLocalAzureFunctionUri(execRequest.FunctionName, new (request.Url.Host, request.Url.Port));
 
             var sw = new Stopwatch();
             sw.Start();
@@ -112,11 +111,9 @@ namespace PlayFab.AzureFunctions
                     // Serialize the output and return it
                     var outputStr = PlayFabSimpleJson.SerializeObject(output);
 
-                    return new HttpResponseMessage
-                    {
-                        Content = CompressResponseBody(output, request),
-                        StatusCode = HttpStatusCode.OK
-                    };
+                    var response = request.CreateResponse(HttpStatusCode.OK);
+                    await response.WriteStringAsync(outputStr);
+                    return response;
                 }
             }
         }
@@ -148,7 +145,7 @@ namespace PlayFab.AzureFunctions
             // Execute the get entity profile request
             using (var profileResponseMessage =
                     await httpClient.PostAsync(getProfileUrl, profileRequestContent))
-            {
+                {
                 using (var profileResponseContent = profileResponseMessage.Content)
                 {
                     string profileResponseString = await profileResponseContent.ReadAsStringAsync();
@@ -346,7 +343,8 @@ namespace PlayFab.AzureFunctions
 
         private static async Task<string> DecompressHttpBody(HttpRequest request)
         {
-            string encoding = request.Headers["Content-Encoding"];
+            var found = request.Headers.TryGetValues("Content-Encoding", out var values);
+            var encoding = found ? values.FirstOrDefault() : string.Empty;
 
             // Compression was not present and hence attempt to simply read out the body provided
             if (string.IsNullOrWhiteSpace(encoding))
@@ -383,13 +381,14 @@ namespace PlayFab.AzureFunctions
             }
         }
 
-        private static HttpContent CompressResponseBody(object responseObject, HttpRequest request)
+        private static HttpContent CompressResponseBody(object responseObject, HttpRequestData request)
         {
             string responseJson = PlayFabSimpleJson.SerializeObject(responseObject);
             var responseBytes = Encoding.UTF8.GetBytes(responseJson);
 
             // Get all accepted encodings,
-            string encodingsString = request.Headers["Accept-Encoding"];
+            var found = request.Headers.TryGetValues("Accept-Encoding", out var values);
+            var encodingsString = found ? values.FirstOrDefault() : string.Empty;
 
             // If client doesn't specify accepted encodings, assume identity and respond decompressed
             if (string.IsNullOrEmpty(encodingsString))
